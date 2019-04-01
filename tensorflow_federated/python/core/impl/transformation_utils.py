@@ -19,6 +19,8 @@ from __future__ import print_function
 
 import abc
 import collections
+import itertools
+import enum
 
 import six
 
@@ -99,6 +101,462 @@ def transform_postorder(comp, fn):
   else:
     raise NotImplementedError(
         'Unrecognized computation building block: {}'.format(str(comp)))
+
+
+def transform_postorder_with_hooks(comp, transform, symbol_tree):
+  """Uses pretransform hooks to execute stateful transformations.
+
+  In this case, 'stateful' means that a transformation executed on
+  a given AST node in general depends on not only the node itself;
+  `transform_postorder_with_hooks` is functional 'from AST to AST' (where
+  `comp` represents the root of an AST) but not 'from node to node'.
+
+  `transform_postorder_with_hooks` hooks into the preorder traversal
+  that is defined by walking down the tree to its leaves, using
+  the information encountered along this path to push context onto
+  the given `SymbolTree`. Once we hit the leaves, we walk back up the
+  tree in a postorder fashion, calling `transform` as we go back up
+  the tree.
+
+  One important fact to note: there are recursion invariants that the
+  `transform_postorder_with_hooks` and `ingest_variable_binding` pipeline
+  enforce. In particular, within a `transform` call, the following
+  invariants hold, for `context_tree` the SymbolTree argument to
+  `transform`:
+    * `context_tree.resolve_and_update_reference` with an argument `ref` of
+      type `Reference` will call `update` on the `CompTracker` in
+      `context_tree` which tracks the value of `ref` active in the current
+      lexical scope.
+    * `context_tree.resolve_and_read_name` with an argument `name` of
+      type `Reference` will return the `CompTracker` instance from
+      `context_tree` which corresponds to the computation bound to
+      the variable `name` in the current lexical scope, or `None` if
+      none exists.
+  These recursion invariants are enforced by the framework, and should be
+  relied on when designing new transformations that depend on variable
+  bindings.
+
+  Args:
+    comp: Instance of `computation_building_blocks.ComputationBuildingBlock` to
+      read information from or transform.
+    transform: Python function accepting `comp` and `context_tree` arguments and
+      returning `transformed_comp`.
+    symbol_tree: Instance of `SymbolTree`, the data structure into which we may
+      read information about variable bindings, and from which we may read.
+
+  Returns:
+    Returns a possibly modified version of `comp`, an instance
+    of `computation_building_blocks.ComputationBuildingBlock`.
+  """
+  py_typecheck.check_type(comp,
+                          computation_building_blocks.ComputationBuildingBlock)
+  py_typecheck.check_type(symbol_tree, SymbolTree)
+  identifier_seq = itertools.count(start=1)
+
+  def _transform_postorder_with_hooks_helper(comp, transform_fn, ctxt_tree,
+                                             identifier_sequence):
+    """Recursive helper function delegated to after binding comp_ids."""
+    comp_id = six.next(identifier_sequence)
+    if isinstance(comp, (computation_building_blocks.CompiledComputation,
+                         computation_building_blocks.Data,
+                         computation_building_blocks.Intrinsic,
+                         computation_building_blocks.Placement,
+                         computation_building_blocks.Reference)):
+      transformed_comp = transform_fn(comp, ctxt_tree)
+    elif isinstance(comp, computation_building_blocks.Selection):
+      transformed_source = _transform_postorder_with_hooks_helper(
+          comp.source, transform_fn, ctxt_tree, identifier_sequence)
+      transformed_comp = transform_fn(
+          computation_building_blocks.Selection(transformed_source, comp.name,
+                                                comp.index), ctxt_tree)
+    elif isinstance(comp, computation_building_blocks.Tuple):
+      new_elems = []
+      for k, v in anonymous_tuple.to_elements(comp):
+        transformed_elem = _transform_postorder_with_hooks_helper(
+            v, transform_fn, ctxt_tree, identifier_sequence)
+        new_elems.append((k, transformed_elem))
+      transformed_comp = transform_fn(
+          computation_building_blocks.Tuple(new_elems), ctxt_tree)
+    elif isinstance(comp, computation_building_blocks.Call):
+      transformed_func = _transform_postorder_with_hooks_helper(
+          comp.function, transform_fn, ctxt_tree, identifier_sequence)
+      if comp.argument is not None:
+        transformed_arg = _transform_postorder_with_hooks_helper(
+            comp.argument, transform_fn, ctxt_tree, identifier_sequence)
+      else:
+        transformed_arg = None
+      transformed_comp = transform_fn(
+          computation_building_blocks.Call(transformed_func, transformed_arg),
+          ctxt_tree)
+    elif isinstance(comp, computation_building_blocks.Lambda):
+      ctxt_tree.ingest_variable_binding(
+          name=comp.parameter_name,
+          value=None,
+          mode=MutationMode.CHILD,
+          comp_id=comp_id)
+      transformed_result = _transform_postorder_with_hooks_helper(
+          comp.result, transform_fn, ctxt_tree, identifier_sequence)
+      transformed_comp = transform_fn(
+          computation_building_blocks.Lambda(comp.parameter_name,
+                                             comp.parameter_type,
+                                             transformed_result), ctxt_tree)
+      ctxt_tree.move_to_parent_context()
+    elif isinstance(comp, computation_building_blocks.Block):
+      transformed_locals = []
+      if comp.locals:
+        first_local_name = comp.locals[0][0]
+        first_local_comp = comp.locals[0][1]
+        new_value = _transform_postorder_with_hooks_helper(
+            first_local_comp, transform_fn, ctxt_tree, identifier_sequence)
+        transformed_locals.append((first_local_name, new_value))
+        ctxt_tree.ingest_variable_binding(
+            name=transformed_locals[0][0],
+            value=transformed_locals[0][1],
+            mode=MutationMode.CHILD,
+            comp_id=comp_id)
+      for k in range(1, len(comp.locals)):
+        new_value = _transform_postorder_with_hooks_helper(
+            comp.locals[k][1], transform_fn, ctxt_tree, identifier_sequence)
+        transformed_locals.append((comp.locals[k][0], new_value))
+        ctxt_tree.ingest_variable_binding(
+            name=transformed_locals[k][0],
+            value=transformed_locals[k][1],
+            mode=MutationMode.SIBLING)
+      transformed_result = _transform_postorder_with_hooks_helper(
+          comp.result, transform_fn, ctxt_tree, identifier_sequence)
+      transformed_comp = transform_fn(
+          computation_building_blocks.Block(transformed_locals,
+                                            transformed_result), ctxt_tree)
+      if comp.locals:
+        ctxt_tree.move_to_parent_context()
+    else:
+      raise NotImplementedError(
+          'Unrecognized computation building block: {}'.format(str(comp)))
+    return transformed_comp
+
+  return _transform_postorder_with_hooks_helper(comp, transform, symbol_tree,
+                                                identifier_seq)
+
+
+class MutationMode(enum.Enum):
+  CHILD = 1
+  SIBLING = 2
+
+
+class SymbolTree(object):
+  """Data structure to hold variable bindings as we walk an AST.
+
+  `SymbolTree` is designed to be constructed and mutatated as we traverse an
+  AST, maintaining a pointer to an active node representing the variable
+  bindings we currently have available as we walk the AST.
+
+  Each instance of the node class can be used at most once in the symbol tree,
+  as checked by memory location. This disallows circular tree structures that
+  could cause an infinite loop in recursive equality testing or printing.
+  """
+
+  def __init__(self, payload_type):
+    """Initializes `SymbolTree` with its payload type.
+
+    Args:
+      payload_type: Class which subclasses BoundVariableTracker; the type of
+        payloads to be constructed and held in this SymbolTree.
+    """
+    initial_node = SequentialBindingNode(OuterContextPointer())
+    py_typecheck.check_subclass(payload_type, BoundVariableTracker)
+    self.active_node = initial_node
+    self.payload_type = payload_type
+    self.node_ids = {id(initial_node): 1}
+
+  def get_payload_with_name(self, name):
+    """Returns payload corresponding to `name` in active variable bindings.
+
+    Args:
+      name: String name to find in currently active context.
+
+    Returns:
+      Returns instance of `BoundVariableTracker` corresponding to `name`
+      in context represented by `active_comp`, or `None` if the requested
+      name is unbound in the current context.
+    """
+    py_typecheck.check_type(name, six.string_types)
+    comp = self.active_node
+    while not isinstance(comp.payload, OuterContextPointer):
+      if name == comp.payload.name:
+        return comp.payload
+      if comp.older_sibling is not None:
+        comp = comp.older_sibling
+      elif comp.parent is not None:
+        comp = comp.parent
+
+  def update_payload_tracking_reference(self, ref):
+    """Calls `update` if it finds its Reference arg among the available symbols.
+
+    Args:
+        ref: Instance of `computation_building_blocks.Reference`; generally,
+          this is the variable a walker has encountered in a TFF AST, and which
+          it is relying on `SymbolTable` to address correctly.
+    """
+    py_typecheck.check_type(ref, computation_building_blocks.Reference)
+    comp = self.active_node
+    while not isinstance(comp.payload, OuterContextPointer):
+      if ref.name == comp.payload.name:
+        comp.payload.update(ref)
+        break
+      if comp.older_sibling is not None:
+        comp = comp.older_sibling
+      elif comp.parent is not None:
+        comp = comp.parent
+
+  def ingest_variable_binding(self, name, value, mode, comp_id=None):
+    """Constructs or updates node in symbol tree as AST is walked.
+
+    Passes `name` and `value` onto the symbol tree's node constructor, with
+    `mode` determining how the node being constructed or updated
+    relates to the symbol tree's `active_node`.
+
+    If there is no preexisting node in the symbol tree bearing the
+    requested relationship to the active node, a new one will be constructed and
+    initialized. If there is an existing node, `ingest_variable_binding` checks
+    that this node has the correct `payload.name`, and overwrites its
+    `payload.value` with the `value` argument.
+
+    Args:
+      name: The string name of the `CompTracker` instance we are constructing or
+        updating.
+      value: Instance of `computation_building_blocks.ComputationBuildingBlock`
+        or `None`, as in the `value` to pass to symbol tree's node payload
+        constructor.
+      mode: Enum indicating the relationship the desired node should bear to the
+        symbol tree's active node. Can be either CHILD or SIBLING.
+      comp_id: Integer `comp_id` generated by walking the tree, used to address
+        children of nodes in the symbol tree. Only necessary if `mode` is
+        'child'.
+
+    Raises:
+      ValueError: If we are passed a name-mode pair such that a
+        preexisting node in the symbol tree bears this relationship with
+        the active node, but has a different name. This is an indication
+        that either a transformation has failed to happen in the symbol tree
+        or that we have a symbol tree instance that does not match the
+        computation we are currently processing.
+    """
+    py_typecheck.check_type(mode, MutationMode)
+    if mode == MutationMode.CHILD:
+      py_typecheck.check_type(comp_id, int)
+    py_typecheck.check_type(name, six.string_types)
+    if value is not None:
+      py_typecheck.check_type(
+          value, computation_building_blocks.ComputationBuildingBlock)
+    node = SequentialBindingNode(self.payload_type(name=name, value=value))
+    if mode == MutationMode.SIBLING:
+      if self.active_node.younger_sibling is None:
+        self._add_younger_sibling(node)
+        self._move_to_younger_sibling()
+      else:
+        if self.active_node.younger_sibling.payload.name != name:
+          raise ValueError(
+              'You have a mismatch between your symbol tree and the '
+              'computation you are trying to process; your symbol tree is {} '
+              'and you are looking for a BoundVariableTracker with name {} '
+              'and value {}'.format(self, name, value))
+        self._move_to_younger_sibling()
+        self.active_node.payload.value = value
+    else:
+      if self.active_node.children.get(comp_id) is None:
+        self._add_child(comp_id, node)
+        self._move_to_child(comp_id)
+      else:
+        if self.active_node.children[comp_id].payload.name != name:
+          raise ValueError(
+              'You have a mismatch between your symbol tree and the '
+              'computation you are trying to process; your symbol tree is {} '
+              'and you are looking for a BoundVariableTracker with name {} '
+              'and value {}'.format(self, name, value))
+        self._move_to_child(comp_id)
+        self.active_node.payload.value = value
+
+  def move_to_parent_context(self):
+    """Moves `active_node` to the parent of current active node.
+
+    Of the `active_node` manipulation methods, this is the only one exposed.
+    This is because the parent-child relationship corresponds directly to
+    passing through a scope-introducing TFF AST node in a postorder traversal;
+    therefore it is convenient to expose this as a mechanism to a TFF AST
+    traversal function. The rest of these manipulation methods are more easily
+    exposed via `ingest_variable_binding`.
+
+    Raises:
+      Raises ValueError if the active node has no parent.
+    """
+    if self.active_node.parent:
+      self.active_node = self.active_node.parent
+    else:
+      raise ValueError('You have tried to move to a nonexistent parent.')
+
+  def _add_younger_sibling(self, comp_tracker):
+    """Appends comp as younger sibling of current `active_node`."""
+    py_typecheck.check_type(comp_tracker, SequentialBindingNode)
+    if self.node_ids.get(id(comp_tracker)):
+      raise ValueError(
+          'Each instance of {} can only appear once in a given symbol tree.'
+          .format(self.payload_type))
+    if self.active_node.younger_sibling is not None:
+      raise ValueError('Ambiguity in adding a younger sibling')
+    if self.active_node.parent is not None:
+      comp_tracker.set_parent(self.active_node.parent)
+    comp_tracker.set_older_sibling(self.active_node)
+    self.active_node.set_younger_sibling(comp_tracker)
+    self.node_ids[id(comp_tracker)] = 1
+
+  def _move_to_younger_sibling(self):
+    """Moves `active_node` to the younger sibling of the current active node.
+
+    Raises:
+      Raises ValueError if the active node has no younger sibling.
+    """
+    if self.active_node.younger_sibling:
+      self.active_node = self.active_node.younger_sibling
+    else:
+      raise ValueError('You have tried to move to a '
+                       'nonexistent younger sibling in ' + str(self))
+
+  def _move_to_older_sibling(self):
+    """Moves `active_node` to the older sibling of the current active node.
+
+    Raises:
+      Raises ValueError if the active node has no older sibling.
+    """
+    if self.active_node.older_sibling:
+      self.active_node = self.active_node.older_sibling
+    else:
+      raise ValueError('You have tried to move to a '
+                       'nonexistent older sibling in ' + str(self))
+
+  def _add_child(self, constructing_comp_id, comp_tracker):
+    """Writes comp to children `dict` of active node with key `comp_id`."""
+    py_typecheck.check_type(comp_tracker, SequentialBindingNode)
+    if self.node_ids.get(id(comp_tracker)):
+      raise ValueError('Each node can only appear once in a given'
+                       'symbol tree. You have tried to add {} '
+                       'twice.'.format(comp_tracker.payload))
+    comp_tracker.set_parent(self.active_node)
+    self.active_node.add_child(constructing_comp_id, comp_tracker)
+    self.node_ids[id(comp_tracker)] = 1
+
+  def _move_to_child(self, comp_id):
+    """Moves `active_node` to child of current active node with key `comp_id`.
+
+    Args:
+      comp_id: Integer representing the position of the child we wish to update
+        `active_node` to point to in a preorder traversal of the AST.
+
+    Raises:
+      Raises ValueError if the active node has no child with the correct id.
+    """
+    if self.active_node.children.get(comp_id) is not None:
+      self.active_node = self.active_node.get_child(comp_id)
+    else:
+      raise ValueError('You have tried to move to a nonexistent child.')
+
+  def _active_node_has_child(self, comp_id):
+    """Checks if `active_node` has a child with key `comp_id`."""
+    if self.active_node.get_child(comp_id):
+      return True
+    else:
+      return False
+
+  def _equal_under_node(self, self_node, other_node):
+    """Recursive helper function to check equality of `SymbolTree`s."""
+    if self_node.payload != other_node.payload:
+      return False
+    children_eq_list = []
+    younger_siblings_equal = True
+    if len(self_node.children) != len(other_node.children):
+      return False
+    for (key_1, val_1), (key_2, val_2) in zip(
+        six.iteritems(self_node.children), six.iteritems(other_node.children)):
+      if key_1 != key_2:
+        return False
+      children_eq_list.append(self._equal_under_node(val_1, val_2))
+    if self_node.younger_sibling:
+      younger_siblings_equal = self._equal_under_node(
+          self_node.younger_sibling, other_node.younger_sibling)
+    elif other_node.younger_sibling:
+      return False
+    return all(
+        children_eq_list
+    ) and younger_siblings_equal and self_node.payload == other_node.payload
+
+  def __eq__(self, other):
+    """Walks to root of `self` and `other` before testing equality of subtrees.
+
+    Args:
+      other: Instance of `SymbolTree` to test for equality with `self`.
+
+    Returns:
+      Returns `True` if and only if `self` and `other` are the same
+      structurally (each node has the same number of children and siblings) and
+      each node of `self` compares as equal with the node in the corresponding
+      position of `other`.
+    """
+    if self is other:
+      return True
+    if not isinstance(other, SymbolTree):
+      return NotImplemented
+    self_node = self.active_node
+    while self_node.parent is not None:
+      self_node = self_node.parent
+    while self_node.older_sibling is not None:
+      self_node = self_node.older_sibling
+    other_node = other.active_node
+    while other_node.parent is not None:
+      other_node = other_node.parent
+    while other_node.older_sibling is not None:
+      other_node = other_node.older_sibling
+    return self._equal_under_node(self_node, other_node)
+
+  def __ne__(self, other):
+    return not self == other
+
+  def _string_under_node(self, node):
+    """Rescursive helper function to generate string reps of `SymbolTree`s."""
+    py_typecheck.check_type(node, SequentialBindingNode)
+    if node is self.active_node:
+      active_node_indicator = '*'
+    else:
+      active_node_indicator = ''
+    symbol_tree_string = '[' + str(node.payload) + active_node_indicator + ']'
+    if node.children:
+      symbol_tree_string += '->{'
+      for _, child_node in six.iteritems(node.children):
+        if not child_node.older_sibling:
+          symbol_tree_string += '('
+          symbol_tree_string += self._string_under_node(child_node)
+          symbol_tree_string += '),('
+      symbol_tree_string = symbol_tree_string[:-2]
+      symbol_tree_string += '}'
+    if node.younger_sibling:
+      symbol_tree_string += '-' + self._string_under_node(node.younger_sibling)
+    return symbol_tree_string
+
+  def __str__(self):
+    """Generates a string representation of this `SymbolTree`.
+
+    First we walk up to the root node, then we walk down
+    the tree generating string rep of this symbol tree.
+
+    Returns:
+      Returns a string representation of the current `SymbolTree`, with
+      the node labeled the active node identified with a *.
+    """
+    node = self.active_node
+    while node.parent is not None:
+      node = node.parent
+    while node.older_sibling is not None:
+      node = node.older_sibling
+    py_typecheck.check_type(node.payload, OuterContextPointer)
+    return self._string_under_node(node)
 
 
 class SequentialBindingNode(object):
